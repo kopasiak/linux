@@ -62,6 +62,7 @@
 #include <linux/kcov.h>
 #include <linux/random.h>
 #include <linux/rcuwait.h>
+#include <linux/rlimit_noti.h>
 
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
@@ -858,6 +859,10 @@ void __noreturn do_exit(long code)
 	if (group_dead)
 		tty_audit_exit();
 	audit_free(tsk);
+#ifdef CONFIG_RLIMIT_NOTIFICATION
+	/* TODO Do we need to lock sth here? */
+	rlimit_noti_task_exit(tsk);
+#endif
 
 	tsk->exit_code = code;
 	taskstats_exit(tsk, group_dead);

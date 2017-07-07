@@ -22,6 +22,7 @@
 #include <linux/spinlock.h>
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
+#include <linux/rlimit_noti.h>
 
 unsigned int sysctl_nr_open __read_mostly = 1024*1024;
 unsigned int sysctl_nr_open_min = BITS_PER_LONG;
@@ -539,6 +540,10 @@ repeat:
 	else
 		__clear_close_on_exec(fd, fdt);
 	error = fd;
+
+	/* HACK HACK HACK */
+	/* TODO add some real fd counting. Fix binder problem */
+	rlimit_noti_res_changed(current, RLIMIT_NOFILE, fd - 1, fd, GFP_ATOMIC);
 #if 1
 	/* Sanity check */
 	if (rcu_access_pointer(fdt->fd[fd]) != NULL) {

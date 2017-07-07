@@ -32,23 +32,35 @@
 #define RLIMIT_RM_NOTI_LVL 2
 
 #define RLIMIT_SET_NOTI_ALL 3
-#define RLIMIT_UNSET_NOTI_ALL 4
+#define RLIMIT_CLEAR_NOTI_ALL 4
 
 /*
  * For future (notify every 5, 10 units change):
  * #define RLIMIT_SET_NOTI_STEP 5
  */
 
-#define RLIMIT_GET_NOTI_LVL 6
+#define RLIMIT_GET_NOTI_LVLS 6
 #define RLIMIT_GET_NOTI_LVL_COUNT 7
 
 /* Flags for ioctl's */
 #define RLIMIT_FLAG_NO_INHERIT 1u << 0
-#define RLIMIT_FLAG_RECURSIVE 1u << 1
 
-struct rlimit_noti_level {
+/* Event types */
+enum {
+	RLIMIT_EVENT_TYPE_RES_CHANGED,
+	RLIMIT_EVENT_TYPE_NEW_PID,
+	RLIMIT_EVENT_TYPE_PID_DEAD,
+	RLIMIT_EVENT_TYPE_MAX
+};
+
+/* TODO take care of padding */
+struct rlimit_noti_subject {
 	pid_t pid;
 	uint32_t resource;
+};
+
+struct rlimit_noti_level {
+	struct rlimit_noti_subject subj;
 	uint64_t value;
 	uint32_t flags;
 };
@@ -68,9 +80,16 @@ struct rlimit_event_pid_dead {
 };
 
 struct rlimit_event_res_changed {
-	pid_t pid;
-	uint32_t resource;
+	struct rlimit_noti_subject subj;
 	uint64_t new_value;
 };
+
+
+/* Public API */
+
+void rlimit_noti_task_exit(struct task_struct *tsk);
+
+void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
+				     uint64_t old, uint64_t new, int mflags);
 
 #endif /* _UAPI_LINUX_RLIMIT_NOTI_H_ */
