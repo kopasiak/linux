@@ -89,6 +89,8 @@ struct rlimit_event_res_changed {
 
 void rlimit_noti_task_exit(struct task_struct *tsk);
 
+int rlimit_noti_watch_active(struct task_struct *tsk, unsigned res);
+
 void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
 				     uint64_t old, uint64_t new, int mflags);
 

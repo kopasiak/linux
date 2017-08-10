@@ -124,6 +124,11 @@ static int rlimit_generate_res_changed_event(struct rlimit_noti_ctx *ctx,
 	return 0;
 }
 
+int rlimit_noti_watch_active(struct task_struct *tsk, unsigned res)
+{
+	return !list_empty(&tsk->signal->rlimit_watchers[res]);
+}
+
 void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
 			     uint64_t old, uint64_t new, int mflags)
 {
