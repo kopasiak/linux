@@ -98,6 +98,8 @@
 
 #include <trace/events/sched.h>
 
+#include <linux/rlimit_noti.h>
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/task.h>
 
@@ -1370,7 +1372,7 @@ static inline void posix_cpu_timers_init_group(struct signal_struct *sig) { }
 static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
 {
 	struct signal_struct *sig;
-
+	int ret;
 	if (clone_flags & CLONE_THREAD)
 		return 0;
 

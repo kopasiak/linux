@@ -48,6 +48,8 @@ struct rlimit_event_list {
 })
 
 struct rlimit_noti_ctx {
+	struct kref kref;
+
 	struct mutex mutex;
 	struct list_head rlimit_watchers;
 
@@ -57,8 +59,6 @@ struct rlimit_noti_ctx {
 };
 
 struct rlimit_watcher {
-	struct kref kref;
-	
 	struct mutex mutex;
 
 	struct rlimit_noti_ctx *ctx;
@@ -79,14 +79,12 @@ struct rlimit_watcher {
 
 static void release_ctx(struct kref *kref)
 {
-	struct rlimit_noti_ctx *ctx = container_of(ctx,
+	struct rlimit_noti_ctx *ctx = container_of(kref,
 						   struct rlimit_noti_ctx, kref);
 	
 	mutex_destroy(&ctx->mutex);
 	mutex_destroy(&ctx->events_mutex);
 	kfree(ctx);
-
-	return 0;
 }
 
 static struct rlimit_watcher *alloc_rlimit_watcher(struct rlimit_noti_ctx *ctx,
@@ -104,7 +102,7 @@ static struct rlimit_watcher *alloc_rlimit_watcher(struct rlimit_noti_ctx *ctx,
 	mutex_init(&w->mutex);
 
 	w->ctx = ctx;
-	kref_get(ctx->kref);
+	kref_get(&ctx->kref);
 	w->task = tsk;
 	w->value = value;
 	w->noti_all_changes = noti_all;
@@ -118,22 +116,23 @@ static void free_rlimit_watcher(struct rlimit_watcher *w)
 	if (!w)
 		return;
 
-	kref_put(&ctx->kref, release_ctx);
+	kref_put(&w->ctx->kref, release_ctx);
 	mutex_destroy(&w->mutex);
 	kfree(w);
 }
 
 
-static inline struct rlimit_watcher *rlimit_watcher_dup(struct rlimit_watcher *org)
+static inline struct rlimit_watcher *rlimit_watcher_dup(
+	struct rlimit_watcher *org, struct task_struct *new_owner)
 {
-	return alloc_rlimit_watcher(org->ctx, org->task, org->value,
+	return alloc_rlimit_watcher(org->ctx, new_owner, org->value,
 				    org->noti_all_changes);
 }
 
 /* This is not called for threads */
 int rlimit_noti_task_fork(struct task_struct *parent, struct task_struct *child)
 {
-	struct rlimit_watcher *w, *w2, *nw, to_free;
+	struct rlimit_watcher *w, *w2, *nw, *to_free;
 	struct signal_struct *sig = child->signal;
 	int i;
 	int ret;
@@ -147,7 +146,7 @@ int rlimit_noti_task_fork(struct task_struct *parent, struct task_struct *child)
 		list_for_each_entry_safe(w, w2, &(parent->signal->rlimit_watchers[i]),
 				    tsk_node) {
 
-			nw = rlimit_watcher_dup(w);
+			nw = rlimit_watcher_dup(w, child);
 			if (!nw)
 				goto cleanup;
 
@@ -175,12 +174,29 @@ int rlimit_noti_task_fork(struct task_struct *parent, struct task_struct *child)
 
 	task_unlock(parent);
 
+	return 0;
+cleanup:
+	for (i = 0; i < ARRAY_SIZE(sig->rlimit_watchers); ++i) {
+		list_for_each_entry_safe(w, w2,
+					 &(sig->rlimit_watchers[i]),
+					 tsk_node) {
+			mutex_lock(&w->mutex);
+			list_del(&w->tsk_node);
+			if (!w->invalid) {
+				w->invalid = 1;
+				mutex_unlock(&w->mutex);
+				continue;
+			}
+			mutex_unlock(&w->mutex);
+			free_rlimit_watcher(w);
+		}
+	}
+	return ret;
 }
 
 void rlimit_noti_task_exit(struct task_struct *tsk)
 {
 	struct rlimit_watcher *w, *w2;
-	int invalid;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(tsk->signal->rlimit_watchers); ++i) {
@@ -241,8 +257,7 @@ int rlimit_noti_watch_active(struct task_struct *tsk, unsigned res)
 void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
 			     uint64_t old, uint64_t new, int mflags)
 {
-	struct rlimit_watcher *w, w2;
-	int invalid;
+	struct rlimit_watcher *w, *w2;
 
 	task_lock(tsk->group_leader);
 	/* TODO this should be replaced with sth faster */
@@ -446,6 +461,8 @@ static int rlimit_noti_release(struct inode *inode, struct file *file)
 	mutex_unlock(&ctx->events_mutex);
 
 	kref_put(&ctx->kref, release_ctx);
+
+	return 0;
 }
 
 static const struct file_operations rlimit_noti_fops = {
@@ -473,7 +490,7 @@ static int rlimit_noti_create_fd(void)
 
 	ret = anon_inode_getfd("rlimit_noti", &rlimit_noti_fops, ctx, 0);
 	if (ret < 0)
-		goto free_ctx;
+		goto put_ctx;
 
 	return ret;
 put_ctx:
