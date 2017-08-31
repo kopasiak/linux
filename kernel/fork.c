@@ -1370,7 +1370,6 @@ static inline void posix_cpu_timers_init_group(struct signal_struct *sig) { }
 static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
 {
 	struct signal_struct *sig;
-	int i;
 
 	if (clone_flags & CLONE_THREAD)
 		return 0;
@@ -1401,13 +1400,15 @@ static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
 #endif
 
 	task_lock(current->group_leader);
-	memcpy(sig->rlim, current->signal->rlim, sizeof sig->rlim);
-	/* TODO: Inherit watchers from parent */
-#ifdef CONFIG_RLIMIT_NOTIFICATION
-	for (i = 0; i < ARRAY_SIZE(sig->rlimit_watchers); ++i)
-		INIT_LIST_HEAD(&sig->rlimit_watchers[i]);
-#endif
+	memcpy(sig->rlim, current->signal->rlim, sizeof(sig->rlim));
 	task_unlock(current->group_leader);
+	/* TODO: check for memory leak in error path */
+#ifdef CONFIG_RLIMIT_NOTIFICATION
+	ret = rlimit_noti_task_fork(current->group_leader, tsk);
+	if (ret)
+		return ret;
+#endif
+
 
 	posix_cpu_timers_init_group(sig);
 

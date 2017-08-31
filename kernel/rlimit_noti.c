@@ -37,8 +37,6 @@
 struct rlimit_event_list {
 	struct rlimit_event ev;
 	union {
-		struct rlimit_event_new_pid npid;
-		struct rlimit_event_pid_dead dpid;
 		struct rlimit_event_res_changed rchanged;
 	} event_data;
 	struct list_head node;
@@ -59,6 +57,10 @@ struct rlimit_noti_ctx {
 };
 
 struct rlimit_watcher {
+	struct kref kref;
+	
+	struct mutex mutex;
+
 	struct rlimit_noti_ctx *ctx;
 	struct task_struct *task;
 
@@ -67,29 +69,136 @@ struct rlimit_watcher {
 
 	uint64_t value;
 	unsigned noti_all_changes:1;
+
+	unsigned invalid:1;
 };
 
 /******************************************************************************
  * Public API
  ******************************************************************************/
 
+static void release_ctx(struct kref *kref)
+{
+	struct rlimit_noti_ctx *ctx = container_of(ctx,
+						   struct rlimit_noti_ctx, kref);
+	
+	mutex_destroy(&ctx->mutex);
+	mutex_destroy(&ctx->events_mutex);
+	kfree(ctx);
+
+	return 0;
+}
+
+static struct rlimit_watcher *alloc_rlimit_watcher(struct rlimit_noti_ctx *ctx,
+						   struct task_struct *tsk,
+						   uint64_t value, bool noti_all)
+{
+	struct rlimit_watcher *w;
+
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w)
+		return ERR_PTR(ENOMEM);
+
+	INIT_LIST_HEAD(&w->tsk_node);
+	INIT_LIST_HEAD(&w->ctx_node);
+	mutex_init(&w->mutex);
+
+	w->ctx = ctx;
+	kref_get(ctx->kref);
+	w->task = tsk;
+	w->value = value;
+	w->noti_all_changes = noti_all;
+	w->invalid = 0;
+
+	return w;
+}
+
+static void free_rlimit_watcher(struct rlimit_watcher *w)
+{
+	if (!w)
+		return;
+
+	kref_put(&ctx->kref, release_ctx);
+	mutex_destroy(&w->mutex);
+	kfree(w);
+}
+
+
+static inline struct rlimit_watcher *rlimit_watcher_dup(struct rlimit_watcher *org)
+{
+	return alloc_rlimit_watcher(org->ctx, org->task, org->value,
+				    org->noti_all_changes);
+}
+
+/* This is not called for threads */
+int rlimit_noti_task_fork(struct task_struct *parent, struct task_struct *child)
+{
+	struct rlimit_watcher *w, *w2, *nw, to_free;
+	struct signal_struct *sig = child->signal;
+	int i;
+	int ret;
+
+	/* init all list to avoid leaving uninitialized lists in case of error */
+	for (i = 0; i < ARRAY_SIZE(sig->rlimit_watchers); ++i)
+		INIT_LIST_HEAD(&sig->rlimit_watchers[i]);
+
+	task_lock(parent);
+	for (i = 0; i < ARRAY_SIZE(sig->rlimit_watchers); ++i) {
+		list_for_each_entry_safe(w, w2, &(parent->signal->rlimit_watchers[i]),
+				    tsk_node) {
+
+			nw = rlimit_watcher_dup(w);
+			if (!nw)
+				goto cleanup;
+
+			mutex_lock(&nw->ctx->mutex);
+			mutex_lock(&w->mutex);
+
+			if (w->invalid) {
+				free_rlimit_watcher(nw);
+				list_del(&w->tsk_node);
+				to_free = w;
+			} else {
+				to_free = NULL;
+				list_add_tail(&nw->tsk_node,
+					      &(sig->rlimit_watchers[i]));
+
+				list_add_tail(&nw->ctx_node,
+					      &(nw->ctx->rlimit_watchers));
+			}
+
+			mutex_unlock(&w->mutex);
+			mutex_unlock(&nw->ctx->mutex);
+			free_rlimit_watcher(to_free);
+		}
+	}
+
+	task_unlock(parent);
+
+}
+
 void rlimit_noti_task_exit(struct task_struct *tsk)
 {
 	struct rlimit_watcher *w, *w2;
+	int invalid;
 	int i;
 
-	/* TODO: generate pid dead event when suitable */
 	for (i = 0; i < ARRAY_SIZE(tsk->signal->rlimit_watchers); ++i) {
 		list_for_each_entry_safe(w, w2,
 					 &(tsk->signal->rlimit_watchers[i]),
 					 tsk_node) {
 			if (w->task != tsk)
 				continue;
+
+			mutex_lock(&w->mutex);
 			list_del(&w->tsk_node);
-			mutex_lock(&w->ctx->mutex);
-			list_del(&w->ctx_node);
-			mutex_unlock(&w->ctx->mutex);
-			kfree(w);
+			if (!w->invalid) {
+				w->invalid = 1;
+				mutex_unlock(&w->mutex);
+				continue;
+			}
+			mutex_unlock(&w->mutex);
+			free_rlimit_watcher(w);
 		}
 	}
 }
@@ -132,11 +241,21 @@ int rlimit_noti_watch_active(struct task_struct *tsk, unsigned res)
 void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
 			     uint64_t old, uint64_t new, int mflags)
 {
-	struct rlimit_watcher *w;
+	struct rlimit_watcher *w, w2;
+	int invalid;
 
 	task_lock(tsk->group_leader);
 	/* TODO this should be replaced with sth faster */
-	list_for_each_entry(w, &tsk->signal->rlimit_watchers[res], tsk_node) {
+	list_for_each_entry_safe(w, w2, &tsk->signal->rlimit_watchers[res],
+				 tsk_node) {
+		mutex_lock(&w->mutex);
+		if (w->invalid) {
+			list_del(&w->tsk_node);
+			mutex_unlock(&w->mutex);
+			free_rlimit_watcher(w);
+			continue;
+		}
+
 		if (w->noti_all_changes ||
 		    (w->value > old && w->value <= new) ||
 		    (w->value > new && w->value <= old)) {
@@ -144,6 +263,7 @@ void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
 			rlimit_generate_res_changed_event(w->ctx, tsk,
 							  res, new, mflags);
 		}
+		mutex_unlock(&w->mutex);
 	}
 	task_unlock(tsk->group_leader);
 }
@@ -151,32 +271,6 @@ void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
 /******************************************************************************
  * FD part
  ******************************************************************************/
-
-static struct rlimit_watcher *alloc_rlimit_watcher(struct rlimit_noti_ctx *ctx,
-						 struct task_struct *tsk,
-						 uint64_t value, bool noti_all)
-{
-	struct rlimit_watcher *w;
-
-	w = kzalloc(sizeof(*w), GFP_KERNEL);
-	if (!w)
-		return ERR_PTR(ENOMEM);
-
-	INIT_LIST_HEAD(&w->tsk_node);
-	INIT_LIST_HEAD(&w->ctx_node);
-
-	w->ctx = ctx;
-	w->task = tsk;
-	w->value = value;
-	w->noti_all_changes = noti_all;
-
-	return w;
-}
-
-static void free_rlimit_watcher(struct rlimit_watcher *w)
-{
-	kfree(w);
-}
 
 static int add_new_watcher(struct rlimit_noti_ctx *ctx, struct task_struct *tsk,
 			   int resource, uint64_t value, bool noti_all)
@@ -194,9 +288,10 @@ static int add_new_watcher(struct rlimit_noti_ctx *ctx, struct task_struct *tsk,
 	read_lock(&tasklist_lock);
 	if (!tsk->sighand) {
 		ret = -ESRCH;
-		goto out;
+		goto free_watcher;
 	}
 
+	mutex_lock(&w->mutex);
 	task_lock(tsk->group_leader);
 	list_add_tail(&w->tsk_node, &tsk->signal->rlimit_watchers[resource]);
 	task_unlock(tsk->group_leader);
@@ -204,10 +299,12 @@ static int add_new_watcher(struct rlimit_noti_ctx *ctx, struct task_struct *tsk,
 	mutex_lock(&ctx->mutex);
 	list_add_tail(&w->ctx_node, &ctx->rlimit_watchers);
 	mutex_unlock(&ctx->mutex);
+	mutex_unlock(&w->mutex);
 
-	ret = 0;
-out:
 	read_unlock(&tasklist_lock);
+	return 0;
+free_watcher:
+	free_rlimit_watcher(w);
 	return ret;
 }
 
@@ -317,24 +414,24 @@ static long rlimit_noti_ioctl(struct file *file, unsigned int cmd, unsigned long
 static int rlimit_noti_release(struct inode *inode, struct file *file)
 {
 	struct rlimit_noti_ctx *ctx = file->private_data;
-	struct rlimit_watcher *w;
+	struct rlimit_watcher *w, *w_to_free;
 	struct rlimit_event_list *ev_list;
 
-	read_lock(&tasklist_lock);
 	mutex_lock(&ctx->mutex);
-
-	list_for_each_entry(w, &ctx->rlimit_watchers, ctx_node) {
-		task_lock(w->task->group_leader);
-		list_del(&w->tsk_node);
-		task_unlock(w->task->group_leader);
-	}
-	read_unlock(&tasklist_lock);
-
 	while (!list_empty(&ctx->rlimit_watchers)) {
 		w = list_first_entry(&ctx->rlimit_watchers,
 				     struct rlimit_watcher, ctx_node);
 		list_del(&w->ctx_node);
-		free_rlimit_watcher(w);
+		mutex_lock(&w->mutex);
+		if (!w->invalid) {
+			w->invalid = 1;
+			w_to_free = NULL;
+		} else {
+			w_to_free = w;
+		}
+		mutex_unlock(&w->mutex);
+
+		free_rlimit_watcher(w_to_free);
 	}
 
 	mutex_unlock(&ctx->mutex);
@@ -348,10 +445,7 @@ static int rlimit_noti_release(struct inode *inode, struct file *file)
 	}
 	mutex_unlock(&ctx->events_mutex);
 
-
-	kfree(ctx);
-
-	return 0;
+	kref_put(&ctx->kref, release_ctx);
 }
 
 static const struct file_operations rlimit_noti_fops = {
@@ -370,6 +464,7 @@ static int rlimit_noti_create_fd(void)
 	if (!ctx)
 		return -ENOMEM;
 
+	kref_init(&ctx->kref);
 	mutex_init(&ctx->mutex);
 	INIT_LIST_HEAD(&ctx->rlimit_watchers);
 	mutex_init(&ctx->events_mutex);
@@ -381,8 +476,8 @@ static int rlimit_noti_create_fd(void)
 		goto free_ctx;
 
 	return ret;
-free_ctx:
-	kfree(ctx);
+put_ctx:
+	kref_put(&ctx->kref, release_ctx);
 	return ret;
 }
 

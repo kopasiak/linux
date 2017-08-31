@@ -70,15 +70,6 @@ struct rlimit_event {
 	size_t size;
 };
 
-struct rlimit_event_new_pid {
-	pid_t parent;
-	pid_t new_pid;
-};
-
-struct rlimit_event_pid_dead {
-	pid_t pid;
-};
-
 struct rlimit_event_res_changed {
 	struct rlimit_noti_subject subj;
 	uint64_t new_value;
@@ -86,6 +77,8 @@ struct rlimit_event_res_changed {
 
 
 /* Public API */
+
+int rlimit_noti_task_fork(struct task_struct *parent, struct task_struct *child);
 
 void rlimit_noti_task_exit(struct task_struct *tsk);
 
