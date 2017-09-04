@@ -76,6 +76,7 @@ extern struct fs_struct init_fs;
 	INIT_POSIX_TIMERS(sig)						\
 	INIT_CPU_TIMERS(sig)						\
 	.rlim		= INIT_RLIMITS,					\
+	.rlimit_watchers = INIT_RLIMIT_WATCHERS(sig.rlimit_watchers), \
 	INIT_CPUTIMER(sig)						\
 	INIT_PREV_CPUTIME(sig)						\
 	.cred_guard_mutex =						\

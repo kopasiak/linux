@@ -81,7 +81,8 @@ static void release_ctx(struct kref *kref)
 {
 	struct rlimit_noti_ctx *ctx = container_of(kref,
 						   struct rlimit_noti_ctx, kref);
-	
+
+
 	mutex_destroy(&ctx->mutex);
 	mutex_destroy(&ctx->events_mutex);
 	kfree(ctx);
@@ -145,7 +146,6 @@ int rlimit_noti_task_fork(struct task_struct *parent, struct task_struct *child)
 	for (i = 0; i < ARRAY_SIZE(sig->rlimit_watchers); ++i) {
 		list_for_each_entry_safe(w, w2, &(parent->signal->rlimit_watchers[i]),
 				    tsk_node) {
-
 			nw = rlimit_watcher_dup(w, child);
 			if (!nw)
 				goto cleanup;
@@ -236,7 +236,7 @@ static int rlimit_generate_res_changed_event(struct rlimit_noti_ctx *ctx,
 	/* TODO add here support for PID namespace */
 	ev_list->event_data.rchanged.subj.pid = tsk->pid;
 	ev_list->event_data.rchanged.subj.resource = resource;
-	printk("New value %d\n", (int)new);
+//	printk("New value %d\n", (int)new);
 	ev_list->event_data.rchanged.new_value = new;
 
 	INIT_LIST_HEAD(&ev_list->node);
@@ -259,6 +259,7 @@ void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
 {
 	struct rlimit_watcher *w, *w2;
 
+//	printk("res changed new: %lld old: %lld \n", new, old);
 	task_lock(tsk->group_leader);
 	/* TODO this should be replaced with sth faster */
 	list_for_each_entry_safe(w, w2, &tsk->signal->rlimit_watchers[res],
@@ -306,15 +307,15 @@ static int add_new_watcher(struct rlimit_noti_ctx *ctx, struct task_struct *tsk,
 		goto free_watcher;
 	}
 
-	mutex_lock(&w->mutex);
-	task_lock(tsk->group_leader);
-	list_add_tail(&w->tsk_node, &tsk->signal->rlimit_watchers[resource]);
-	task_unlock(tsk->group_leader);
-
+//	mutex_lock(&w->mutex);
 	mutex_lock(&ctx->mutex);
 	list_add_tail(&w->ctx_node, &ctx->rlimit_watchers);
 	mutex_unlock(&ctx->mutex);
-	mutex_unlock(&w->mutex);
+
+	task_lock(tsk->group_leader);
+	list_add_tail(&w->tsk_node, &tsk->signal->rlimit_watchers[resource]);
+	task_unlock(tsk->group_leader);
+//	mutex_unlock(&w->mutex);
 
 	read_unlock(&tasklist_lock);
 	return 0;

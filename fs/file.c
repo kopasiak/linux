@@ -487,6 +487,14 @@ static unsigned int count_open_fds(struct fdtable *fdt)
 	unsigned int count = 0;
 	uint64_t tmp;
 
+//	printk("start");
+	while (bitbit <= maxfd) {
+//		printk("Bitbit %u\n", bitbit);
+		bitbit = find_next_bit(fdt->open_fds, maxfd, bitbit);
+		bitbit++;
+		count++;
+	}
+	return count - 1;
 	while (1) {
 		bitbit = find_next_zero_bit(fdt->full_fds_bits, maxbit, bitbit);
 		if (bitbit > maxbit) {
