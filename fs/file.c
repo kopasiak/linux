@@ -584,9 +584,9 @@ repeat:
 	if (rlimit_noti_watch_active(owner, RLIMIT_NOFILE)) {
 		unsigned int count;
 
-		count = count_open_fds(fdt);
+//		count = count_open_fds(fdt);
 		rlimit_noti_res_changed(owner, RLIMIT_NOFILE,
-					count - 1, count, GFP_ATOMIC);
+					fd - 1, fd, GFP_ATOMIC);
 	}
 #if 1
 	/* Sanity check */
