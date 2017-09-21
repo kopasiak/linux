@@ -2,7 +2,7 @@
 #define _ASM_GENERIC_RESOURCE_H
 
 #include <uapi/asm-generic/resource.h>
-
+#include <linux/spinlock.h>
 
 /*
  * boot-time rlimit defaults for the init task:
@@ -50,4 +50,10 @@
 	INIT_RLIMIT_WATCHER(watchers, RLIMIT_RTTIME),		\
 }
 
+#define INIT_RLIMIT_EVENTS_CTX(ctx)			\
+{							\
+	.lock = __SPIN_LOCK_UNLOCKED(ctx.lock),			\
+	.watchers = INIT_RLIMIT_WATCHERS(ctx.watchers),	\
+	.process_dead = 0,				\
+}
 #endif

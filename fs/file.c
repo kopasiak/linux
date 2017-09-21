@@ -585,8 +585,7 @@ repeat:
 		unsigned int count;
 
 //		count = count_open_fds(fdt);
-		rlimit_noti_res_changed(owner, RLIMIT_NOFILE,
-					fd - 1, fd, GFP_ATOMIC);
+		rlimit_noti_res_changed(owner, RLIMIT_NOFILE, fd - 1, fd);
 	}
 #if 1
 	/* Sanity check */
@@ -626,8 +625,7 @@ static void __put_unused_fd(struct task_struct *owner,
 		unsigned int count;
 
 		count = count_open_fds(fdt);
-		rlimit_noti_res_changed(owner, RLIMIT_NOFILE,
-					count + 1, count, GFP_ATOMIC);
+		rlimit_noti_res_changed(owner, RLIMIT_NOFILE, count + 1, count);
 	}
 }
 
@@ -919,8 +917,7 @@ __releases(&files->file_lock)
 		unsigned int count;
 
 		count = count_open_fds(fdt);
-		rlimit_noti_res_changed(current, RLIMIT_NOFILE,
-					count - 1, count, GFP_ATOMIC);
+		rlimit_noti_res_changed(current, RLIMIT_NOFILE, count - 1, count);
 	}
 
 	spin_unlock(&files->file_lock);

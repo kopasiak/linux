@@ -75,6 +75,17 @@ struct rlimit_event_res_changed {
 	uint64_t new_value;
 };
 
+#ifdef __KERNEL__
+
+struct rlimit_noti_ctx {
+	/* for mdification protection */
+	spinlock_t lock;
+	/* protected by RCU */
+	struct list_head watchers[RLIM_NLIMITS];
+
+	unsigned process_dead:1;
+};
+
 
 /* Public API */
 
@@ -85,6 +96,7 @@ void rlimit_noti_task_exit(struct task_struct *tsk);
 int rlimit_noti_watch_active(struct task_struct *tsk, unsigned res);
 
 void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
-				     uint64_t old, uint64_t new, int mflags);
+			     uint64_t old, uint64_t new);
 
+#endif
 #endif /* _UAPI_LINUX_RLIMIT_NOTI_H_ */

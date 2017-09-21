@@ -392,7 +392,7 @@ void free_task(struct task_struct *tsk)
 }
 EXPORT_SYMBOL(free_task);
 
-static inline void free_signal_struct(struct signal_struct *sig)
+void free_signal_struct(struct signal_struct *sig)
 {
 	taskstats_tgid_free(sig);
 	sched_autogroup_exit(sig);
@@ -404,12 +404,7 @@ static inline void free_signal_struct(struct signal_struct *sig)
 		mmdrop_async(sig->oom_mm);
 	kmem_cache_free(signal_cachep, sig);
 }
-
-static inline void put_signal_struct(struct signal_struct *sig)
-{
-	if (atomic_dec_and_test(&sig->sigcnt))
-		free_signal_struct(sig);
-}
+EXPORT_SYMBOL_GPL(free_signal_struct);
 
 void __put_task_struct(struct task_struct *tsk)
 {

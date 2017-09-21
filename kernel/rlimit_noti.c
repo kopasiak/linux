@@ -32,6 +32,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/anon_inodes.h>
 #include <linux/sched/signal.h>
+#include <linux/spinlock.h>
 
 
 struct rlimit_event_list {
@@ -47,30 +48,28 @@ struct rlimit_event_list {
 			sizeof(_rl->event_data);		\
 })
 
-struct rlimit_noti_ctx {
+struct rlimit_watch_fd_ctx {
 	struct kref kref;
 
-	struct mutex mutex;
-	struct list_head rlimit_watchers;
-
-	struct mutex events_mutex;
+	spinlock_t noti_ctx_lock;
+	struct list_head watchers;
+	unsigned fd_invalid:1;
+	
+	spinlock_t events_lock;
 	wait_queue_head_t events_queue;
 	struct list_head events;
 };
 
 struct rlimit_watcher {
-	struct mutex mutex;
-
-	struct rlimit_noti_ctx *ctx;
-	struct task_struct *task;
+	struct rcu_head rcu;
+	struct rlimit_watch_fd_ctx *ctx;
+	struct signal_struct *signal;
 
 	struct list_head tsk_node;
 	struct list_head ctx_node;
 
 	uint64_t value;
 	unsigned noti_all_changes:1;
-
-	unsigned invalid:1;
 };
 
 /******************************************************************************
@@ -79,35 +78,31 @@ struct rlimit_watcher {
 
 static void release_ctx(struct kref *kref)
 {
-	struct rlimit_noti_ctx *ctx = container_of(kref,
-						   struct rlimit_noti_ctx, kref);
+	struct rlimit_watch_fd_ctx *ctx = container_of(kref,
+						   struct rlimit_watch_fd_ctx, kref);
 
-
-	mutex_destroy(&ctx->mutex);
-	mutex_destroy(&ctx->events_mutex);
 	kfree(ctx);
 }
 
-static struct rlimit_watcher *alloc_rlimit_watcher(struct rlimit_noti_ctx *ctx,
-						   struct task_struct *tsk,
+static struct rlimit_watcher *alloc_rlimit_watcher(struct rlimit_watch_fd_ctx *ctx,
+						   struct signal_struct *signal,
 						   uint64_t value, bool noti_all)
 {
 	struct rlimit_watcher *w;
 
-	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	w = kzalloc(sizeof(*w), GFP_ATOMIC);
 	if (!w)
 		return ERR_PTR(ENOMEM);
 
 	INIT_LIST_HEAD(&w->tsk_node);
 	INIT_LIST_HEAD(&w->ctx_node);
-	mutex_init(&w->mutex);
 
 	w->ctx = ctx;
 	kref_get(&ctx->kref);
-	w->task = tsk;
+	w->signal = signal;
+	get_signal_struct(signal);
 	w->value = value;
 	w->noti_all_changes = noti_all;
-	w->invalid = 0;
 
 	return w;
 }
@@ -118,77 +113,109 @@ static void free_rlimit_watcher(struct rlimit_watcher *w)
 		return;
 
 	kref_put(&w->ctx->kref, release_ctx);
-	mutex_destroy(&w->mutex);
+	put_signal_struct(w->signal);
 	kfree(w);
 }
 
+static void free_rlimit_watcher_rcu(struct rcu_head *head)
+{
+	free_rlimit_watcher(container_of(head, struct rlimit_watcher, rcu));
+}
 
 static inline struct rlimit_watcher *rlimit_watcher_dup(
 	struct rlimit_watcher *org, struct task_struct *new_owner)
 {
-	return alloc_rlimit_watcher(org->ctx, new_owner, org->value,
+	return alloc_rlimit_watcher(org->ctx, new_owner->signal, org->value,
 				    org->noti_all_changes);
 }
 
 /* This is not called for threads */
 int rlimit_noti_task_fork(struct task_struct *parent, struct task_struct *child)
 {
-	struct rlimit_watcher *w, *w2, *nw, *to_free;
+	struct rlimit_watcher *w, *nw;
 	struct signal_struct *sig = child->signal;
+	unsigned long flags, flags2;
 	int i;
 	int ret;
 
 	/* init all list to avoid leaving uninitialized lists in case of error */
-	for (i = 0; i < ARRAY_SIZE(sig->rlimit_watchers); ++i)
-		INIT_LIST_HEAD(&sig->rlimit_watchers[i]);
+	for (i = 0; i < ARRAY_SIZE(sig->rlimit_events_ctx.watchers); ++i)
+		INIT_LIST_HEAD(&sig->rlimit_events_ctx.watchers[i]);
 
-	task_lock(parent);
-	for (i = 0; i < ARRAY_SIZE(sig->rlimit_watchers); ++i) {
-		list_for_each_entry_safe(w, w2, &(parent->signal->rlimit_watchers[i]),
+	spin_lock_init(&sig->rlimit_events_ctx.lock);
+	sig->rlimit_events_ctx.process_dead = 0;
+
+	/* Lock the list to be safe against modification */
+	spin_lock_irqsave(&parent->signal->rlimit_events_ctx.lock, flags);
+	
+	for (i = 0; i < ARRAY_SIZE(sig->rlimit_events_ctx.watchers); ++i) {
+		list_for_each_entry(w,
+				    &parent->signal->rlimit_events_ctx.watchers[i],
 				    tsk_node) {
 			nw = rlimit_watcher_dup(w, child);
-			if (!nw)
+			if (!nw) {
+				spin_unlock_irqrestore(
+					&parent->signal->rlimit_events_ctx.lock,
+					flags);
+				ret = -ENOMEM;
 				goto cleanup;
-
-			mutex_lock(&nw->ctx->mutex);
-			mutex_lock(&w->mutex);
-
-			if (w->invalid) {
-				free_rlimit_watcher(nw);
-				list_del(&w->tsk_node);
-				to_free = w;
-			} else {
-				to_free = NULL;
-				list_add_tail(&nw->tsk_node,
-					      &(sig->rlimit_watchers[i]));
-
-				list_add_tail(&nw->ctx_node,
-					      &(nw->ctx->rlimit_watchers));
 			}
 
-			mutex_unlock(&w->mutex);
-			mutex_unlock(&nw->ctx->mutex);
-			free_rlimit_watcher(to_free);
+			/*
+			 * For now we put this only on task side list
+			 * to avoid deadlock (ABBA)
+			 *
+			 * We assume that no one can access this new task
+			 * for now so we don't use any locking here
+			 */
+			list_add_tail_rcu(&nw->tsk_node,
+					  &sig->rlimit_events_ctx.watchers[i]);
 		}
 	}
 
-	task_unlock(parent);
+	/*
+	 * now we got all watchers on our brand new list so we can release
+	 * parent lock and allow modification of his list
+	 */
+	spin_unlock_irqrestore(&parent->signal->rlimit_events_ctx.lock, flags);
+
+	for (i = 0; i < ARRAY_SIZE(sig->rlimit_events_ctx.watchers); ++i) {
+start_again:
+		rcu_read_lock();
+		list_for_each_entry_rcu(w,
+					&sig->rlimit_events_ctx.watchers[i],
+					tsk_node) {
+			spin_lock_irqsave(&w->ctx->noti_ctx_lock, flags);
+			if (list_empty(&w->ctx_node)) {
+				if (!w->ctx->fd_invalid) {
+					list_add_tail(&w->ctx_node,
+						      &w->ctx->watchers);
+				} else {
+					spin_lock_irqsave(
+						&sig->rlimit_events_ctx.lock, flags2);
+					list_del_rcu(&w->tsk_node);
+					call_rcu(&w->rcu, free_rlimit_watcher_rcu);
+					spin_unlock_irqrestore(
+						&sig->rlimit_events_ctx.lock, flags2);
+					rcu_read_unlock();
+					goto start_again;
+				}
+			}
+			spin_unlock_irqrestore(&w->ctx->noti_ctx_lock, flags);
+		}
+		rcu_read_unlock();
+	}
 
 	return 0;
 cleanup:
-	for (i = 0; i < ARRAY_SIZE(sig->rlimit_watchers); ++i) {
-		list_for_each_entry_safe(w, w2,
-					 &(sig->rlimit_watchers[i]),
-					 tsk_node) {
-			mutex_lock(&w->mutex);
-			list_del(&w->tsk_node);
-			if (!w->invalid) {
-				w->invalid = 1;
-				mutex_unlock(&w->mutex);
-				continue;
-			}
-			mutex_unlock(&w->mutex);
-			free_rlimit_watcher(w);
+	for (i = 0; i < ARRAY_SIZE(sig->rlimit_events_ctx.watchers); ++i) {
+		struct list_head *head = sig->rlimit_events_ctx.watchers + i;
+
+		while (!list_empty(head)) {
+			w = list_first_entry(head,
+					     struct rlimit_watcher, ctx_node);
+			list_del_init(&w->tsk_node);
+			call_rcu(&w->rcu, free_rlimit_watcher_rcu);
 		}
 	}
 	return ret;
@@ -196,35 +223,62 @@ cleanup:
 
 void rlimit_noti_task_exit(struct task_struct *tsk)
 {
-	struct rlimit_watcher *w, *w2;
+	struct rlimit_watcher *w;
+	struct rlimit_noti_ctx *n_ctx = &tsk->signal->rlimit_events_ctx;
+	unsigned long flags;
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(tsk->signal->rlimit_watchers); ++i) {
-		list_for_each_entry_safe(w, w2,
-					 &(tsk->signal->rlimit_watchers[i]),
-					 tsk_node) {
-			if (w->task != tsk)
-				continue;
+	if (tsk != tsk->group_leader)
+		return;
 
-			mutex_lock(&w->mutex);
-			list_del(&w->tsk_node);
-			if (!w->invalid) {
-				w->invalid = 1;
-				mutex_unlock(&w->mutex);
-				continue;
-			}
-			mutex_unlock(&w->mutex);
-			free_rlimit_watcher(w);
+	/*
+	 * Let's mark that we are in the middle of cleaning up
+	 * to prevent new watchers from being added to the list
+	 */
+	spin_lock_irqsave(&n_ctx->lock, flags);
+	WARN_ON(n_ctx->process_dead);
+	n_ctx->process_dead = true;
+	spin_unlock_irqrestore(&n_ctx->lock, flags);
+
+	for (i = 0; i < ARRAY_SIZE(tsk->signal->rlimit_events_ctx.watchers); ++i) {
+		struct list_head *head = tsk->signal->rlimit_events_ctx.watchers + i;
+
+		/* 
+		 * Let's go through the list and remove watchers form respective
+		 * fd contextes.
+		 */
+		rcu_read_lock();
+		list_for_each_entry_rcu(w, head, tsk_node) {
+			spin_lock_irqsave(&w->ctx->noti_ctx_lock, flags);
+			/*
+			 * List empty means that between iteration and acquiring
+			 * lock this watcher has been already removed and
+			 * it's just hanging due to grace period
+			 */
+			if (!list_empty(&w->ctx_node) && !list_empty(&w->tsk_node))
+				list_del_init(&w->ctx_node);
+			spin_unlock_irqrestore(&w->ctx->noti_ctx_lock, flags);
 		}
+		rcu_read_unlock();
+
+		/* Now let's cleanup our list */
+		spin_lock_irqsave(&n_ctx->lock, flags);
+		while (!list_empty(head)) {
+			w = list_first_entry(head, struct rlimit_watcher, tsk_node);
+			list_del_rcu(&w->tsk_node);
+			call_rcu(&w->rcu, free_rlimit_watcher_rcu);
+		}
+		spin_unlock_irqrestore(&n_ctx->lock, flags);
 	}
 }
 
-static int rlimit_generate_res_changed_event(struct rlimit_noti_ctx *ctx,
+static int rlimit_generate_res_changed_event(struct rlimit_watch_fd_ctx *ctx,
 					     struct task_struct *tsk,
 					     unsigned resource,
 					     uint64_t new, int mflags)
 {
 	struct rlimit_event_list *ev_list;
+	unsigned long flags;
 
 	ev_list = kzalloc(sizeof(*ev_list), mflags);
 	if (!ev_list)
@@ -241,114 +295,124 @@ static int rlimit_generate_res_changed_event(struct rlimit_noti_ctx *ctx,
 
 	INIT_LIST_HEAD(&ev_list->node);
 
-	mutex_lock(&ctx->events_mutex);
+	spin_lock_irqsave(&ctx->events_lock, flags);
 	list_add_tail(&ev_list->node, &ctx->events);
 	wake_up_interruptible(&ctx->events_queue);
-	mutex_unlock(&ctx->events_mutex);
+	spin_unlock_irqrestore(&ctx->events_lock, flags);
 
 	return 0;
 }
 
 int rlimit_noti_watch_active(struct task_struct *tsk, unsigned res)
 {
-	return !list_empty(&tsk->signal->rlimit_watchers[res]);
+	return !list_empty(&tsk->signal->rlimit_events_ctx.watchers[res]);
 }
 
 void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
-			     uint64_t old, uint64_t new, int mflags)
+			     uint64_t old, uint64_t new)
 {
-	struct rlimit_watcher *w, *w2;
+	struct rlimit_watcher *w;
+	struct signal_struct *signal = tsk->signal;
 
-//	printk("res changed new: %lld old: %lld \n", new, old);
-	task_lock(tsk->group_leader);
+	rcu_read_lock();
 	/* TODO this should be replaced with sth faster */
-	list_for_each_entry_safe(w, w2, &tsk->signal->rlimit_watchers[res],
-				 tsk_node) {
-		mutex_lock(&w->mutex);
-		if (w->invalid) {
-			list_del(&w->tsk_node);
-			mutex_unlock(&w->mutex);
-			free_rlimit_watcher(w);
-			continue;
-		}
-
+	list_for_each_entry_rcu(w, &signal->rlimit_events_ctx.watchers[res],
+				tsk_node)
 		if (w->noti_all_changes ||
 		    (w->value > old && w->value <= new) ||
 		    (w->value > new && w->value <= old)) {
 			/* ignore error as there is nothing we can do */
 			rlimit_generate_res_changed_event(w->ctx, tsk,
-							  res, new, mflags);
+							  res, new, GFP_ATOMIC);
 		}
-		mutex_unlock(&w->mutex);
-	}
-	task_unlock(tsk->group_leader);
+	rcu_read_unlock();
 }
 
 /******************************************************************************
  * FD part
  ******************************************************************************/
 
-static int add_new_watcher(struct rlimit_noti_ctx *ctx, struct task_struct *tsk,
+static int add_new_watcher(struct rlimit_watch_fd_ctx *ctx, struct task_struct *tsk,
 			   int resource, uint64_t value, bool noti_all)
 {
 	struct rlimit_watcher *w;
+	struct signal_struct *signal;
+	unsigned long flags, flags2;
 	int ret = 0;
 
 	if (resource >= RLIM_NLIMITS)
 		return -EINVAL;
 
-	w = alloc_rlimit_watcher(ctx, tsk, value, noti_all);
-	if (IS_ERR(w))
-		return PTR_ERR(w);
-
 	read_lock(&tasklist_lock);
 	if (!tsk->sighand) {
 		ret = -ESRCH;
-		goto free_watcher;
+		goto unlock_read;
 	}
 
-//	mutex_lock(&w->mutex);
-	mutex_lock(&ctx->mutex);
-	list_add_tail(&w->ctx_node, &ctx->rlimit_watchers);
-	mutex_unlock(&ctx->mutex);
-
 	task_lock(tsk->group_leader);
-	list_add_tail(&w->tsk_node, &tsk->signal->rlimit_watchers[resource]);
-	task_unlock(tsk->group_leader);
-//	mutex_unlock(&w->mutex);
+	signal = tsk->signal;
 
+	w = alloc_rlimit_watcher(ctx, signal, value, noti_all);
+	if (IS_ERR(w)) {
+		ret = PTR_ERR(w);
+		goto unlock_group_leader;
+	}
+
+	spin_lock_irqsave(&ctx->noti_ctx_lock, flags);
+	/*
+	 * First add it to ctx list as we are holding it's lock
+	 * and no one is going to modify or iterate it
+	 */
+	list_add_tail(&w->ctx_node, &ctx->watchers);
+	/* Now let's lock process side lock and add this torcu protected list */
+	spin_lock_irqsave(&signal->rlimit_events_ctx.lock, flags2);
+
+	/* If process is in the middle of cleanup let's rollback everything */
+	if (!signal->rlimit_events_ctx.process_dead) {
+		list_add_tail_rcu(&signal->rlimit_events_ctx.watchers[resource],
+				  &w->tsk_node);
+		ret = 0;
+	} else {
+		list_del(&w->ctx_node);
+		free_rlimit_watcher(w);
+		ret = -ENOENT;
+	}
+
+	spin_unlock_irqrestore(&signal->rlimit_events_ctx.lock, flags2);
+	spin_unlock_irqrestore(&ctx->noti_ctx_lock, flags);
+unlock_group_leader:
+	task_unlock(tsk->group_leader);
+unlock_read:
 	read_unlock(&tasklist_lock);
-	return 0;
-free_watcher:
-	free_rlimit_watcher(w);
+
 	return ret;
 }
 
 ssize_t rlimit_noti_read_event(struct file *file, char __user *buf,
 			       size_t size, loff_t *ptr)
 {
-	struct rlimit_noti_ctx *ctx = file->private_data;
+	struct rlimit_watch_fd_ctx *ctx = file->private_data;
 	struct rlimit_event_list *ev_list;
+	unsigned long flags;
 	size_t ret;
 
 	/* TODO allow to read only part of event */
 	if (size < MAX_RLIMIT_EVENT_SIZE)
 		return -EINVAL;
 
-	mutex_lock(&ctx->events_mutex);
+	spin_lock_irqsave(&ctx->events_lock, flags);
 #define READ_COND (!list_empty(&ctx->events))
 	while (!READ_COND) {
-		mutex_unlock(&ctx->events_mutex);
+		spin_unlock_irqrestore(&ctx->events_lock, flags);
 
 		if (wait_event_interruptible(ctx->events_queue, READ_COND))
 			return -ERESTARTSYS;
-
-		mutex_lock(&ctx->events_mutex);
+		spin_lock_irqsave(&ctx->events_lock, flags);
 	}
 
 	ev_list = list_first_entry(&ctx->events, struct rlimit_event_list, node);
 	list_del(&ev_list->node);
-	mutex_unlock(&ctx->events_mutex);
+	spin_unlock_irqrestore(&ctx->events_lock, flags);
 
 	/* TODO handle fault */
 	ret = copy_to_user(buf, &ev_list->ev, ev_list->ev.size);
@@ -366,51 +430,42 @@ unsigned int rlimit_noti_poll(struct file *file, struct poll_table_struct *)
 
 static long rlimit_noti_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	struct rlimit_noti_ctx *ctx = file->private_data;
+	struct rlimit_watch_fd_ctx *ctx = file->private_data;
+	struct task_struct *tsk;
+	struct rlimit_noti_level nlvl;
+	bool noti_all = false;
 	int ret;
 
 	switch (cmd) {
-	case RLIMIT_SET_NOTI_ALL: {
-		struct task_struct *tsk;
-		struct rlimit_noti_subject subj;
-
-		if (copy_from_user(&subj, (void __user *)arg, sizeof(subj)))
+	case RLIMIT_SET_NOTI_ALL:
+		if (copy_from_user(&nlvl.subj,
+				   (void __user *)arg, sizeof(nlvl.subj)))
 			return -EFAULT;
 
-		rcu_read_lock();
-		tsk = find_task_by_pid_ns(subj.pid, task_active_pid_ns(current));
-		rcu_read_unlock();
-		if (!tsk) {
-			printk("No PID in current NS\n");
-			return -EINVAL;
-		}
+		nlvl.value = 0;
+		noti_all = true;
+		goto set_watch;
 
-		/* TODO check for duplicates before adding */
-		ret = add_new_watcher(ctx, tsk, subj.resource, 0, true);
-		break;
-	}
-
-	case RLIMIT_ADD_NOTI_LVL: {
-		struct task_struct *tsk;
-		struct rlimit_noti_level nlvl;
-
+	case RLIMIT_ADD_NOTI_LVL:
 		if (copy_from_user(&nlvl, (void __user *)arg, sizeof(nlvl)))
 			return -EFAULT;
-
+set_watch:
 		rcu_read_lock();
-		tsk = find_task_by_pid_ns(nlvl.subj.pid,
-					   task_active_pid_ns(current));
-		rcu_read_unlock();
+		tsk = find_task_by_vpid(nlvl.subj.pid);
 		if (!tsk) {
+			rcu_read_unlock();
 			printk("No PID in current NS\n");
 			return -EINVAL;
 		}
+
+		get_task_struct(tsk);
+		rcu_read_unlock();
 
 		/* TODO check for duplicates before adding */
 		ret = add_new_watcher(ctx, tsk, nlvl.subj.resource,
 				      nlvl.value, false);
+		put_task_struct(tsk);
 		break;
-	}
 
 	case RLIMIT_CLEAR_NOTI_ALL:
 	case RLIMIT_RM_NOTI_LVL:
@@ -429,37 +484,40 @@ static long rlimit_noti_ioctl(struct file *file, unsigned int cmd, unsigned long
 
 static int rlimit_noti_release(struct inode *inode, struct file *file)
 {
-	struct rlimit_noti_ctx *ctx = file->private_data;
-	struct rlimit_watcher *w, *w_to_free;
+	struct rlimit_watch_fd_ctx *ctx = file->private_data;
+	struct rlimit_watcher *w;
 	struct rlimit_event_list *ev_list;
+	unsigned long flags, flags2;
 
-	mutex_lock(&ctx->mutex);
-	while (!list_empty(&ctx->rlimit_watchers)) {
-		w = list_first_entry(&ctx->rlimit_watchers,
-				     struct rlimit_watcher, ctx_node);
-		list_del(&w->ctx_node);
-		mutex_lock(&w->mutex);
-		if (!w->invalid) {
-			w->invalid = 1;
-			w_to_free = NULL;
-		} else {
-			w_to_free = w;
-		}
-		mutex_unlock(&w->mutex);
-
-		free_rlimit_watcher(w_to_free);
+	/* Clean up watchers */
+	spin_lock_irqsave(&ctx->noti_ctx_lock, flags);
+	ctx->fd_invalid = 1;
+	list_for_each_entry(w, &ctx->watchers, ctx_node) {
+		spin_lock_irqsave(&w->signal->rlimit_events_ctx.lock, flags2);
+		list_del_rcu(&w->tsk_node);
+		spin_unlock_irqrestore(&w->signal->rlimit_events_ctx.lock, flags2);
 	}
 
-	mutex_unlock(&ctx->mutex);
+	while (!list_empty(&ctx->watchers)) {
+		w = list_first_entry(&ctx->watchers,
+				     struct rlimit_watcher, ctx_node);
+		list_del_init(&w->ctx_node);
+		call_rcu(&w->rcu, free_rlimit_watcher_rcu);
+	}
 
-	mutex_lock(&ctx->events_mutex);
+	spin_unlock_irqrestore(&ctx->noti_ctx_lock, flags);
+
+	/* to ensure that no more events will be generated */
+	synchronize_rcu();
+	
+	spin_lock_irqsave(&ctx->events_lock, flags);
 	while (!list_empty(&ctx->events)) {
 		ev_list = list_first_entry(&ctx->events,
 					   struct rlimit_event_list, node);
 		list_del(&ev_list->node);
 		kfree(ev_list);
 	}
-	mutex_unlock(&ctx->events_mutex);
+	spin_unlock_irqrestore(&ctx->events_lock, flags);
 
 	kref_put(&ctx->kref, release_ctx);
 
@@ -475,7 +533,7 @@ static const struct file_operations rlimit_noti_fops = {
 
 static int rlimit_noti_create_fd(void)
 {
-	struct rlimit_noti_ctx *ctx;
+	struct rlimit_watch_fd_ctx *ctx;
 	int ret;
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
@@ -483,9 +541,9 @@ static int rlimit_noti_create_fd(void)
 		return -ENOMEM;
 
 	kref_init(&ctx->kref);
-	mutex_init(&ctx->mutex);
-	INIT_LIST_HEAD(&ctx->rlimit_watchers);
-	mutex_init(&ctx->events_mutex);
+	spin_lock_init(&ctx->noti_ctx_lock);
+	INIT_LIST_HEAD(&ctx->watchers);
+	spin_lock_init(&ctx->events_lock);
 	INIT_LIST_HEAD(&ctx->events);
 	init_waitqueue_head(&ctx->events_queue);
 

@@ -9,6 +9,7 @@
 #include <linux/cred.h>
 #include <linux/list.h>
 
+#include <linux/rlimit_noti.h>
 /*
  * Types defining task->signal and task->sighand and APIs using them:
  */
@@ -199,7 +200,7 @@ struct signal_struct {
 	struct rlimit rlim[RLIM_NLIMITS];
 
 #ifdef CONFIG_RLIMIT_NOTIFICATION
-	struct list_head rlimit_watchers[RLIM_NLIMITS];
+	struct rlimit_noti_ctx rlimit_events_ctx;
 #endif
 
 #ifdef CONFIG_BSD_PROCESS_ACCT
@@ -612,6 +613,19 @@ static inline unsigned long rlimit(unsigned int limit)
 static inline unsigned long rlimit_max(unsigned int limit)
 {
 	return task_rlimit_max(current, limit);
+}
+
+void free_signal_struct(struct signal_struct *sig);
+
+static inline void put_signal_struct(struct signal_struct *sig)
+{
+	if (atomic_dec_and_test(&sig->sigcnt))
+		free_signal_struct(sig);
+}
+
+static inline void get_signal_struct(struct signal_struct *sig)
+{
+	atomic_inc(&sig->sigcnt);
 }
 
 #endif /* _LINUX_SCHED_SIGNAL_H */
