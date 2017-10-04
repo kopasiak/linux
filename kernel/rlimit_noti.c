@@ -134,7 +134,7 @@ int rlimit_noti_task_fork(struct task_struct *parent, struct task_struct *child)
 {
 	struct rlimit_watcher *w, *nw;
 	struct signal_struct *sig = child->signal;
-	unsigned long flags, flags2;
+	unsigned long flags;
 	int i;
 	int ret;
 
@@ -191,12 +191,10 @@ start_again:
 					list_add_tail(&w->ctx_node,
 						      &w->ctx->watchers);
 				} else {
-					spin_lock_irqsave(
-						&sig->rlimit_events_ctx.lock, flags2);
+					spin_lock(&sig->rlimit_events_ctx.lock);
 					list_del_rcu(&w->tsk_node);
 					call_rcu(&w->rcu, free_rlimit_watcher_rcu);
-					spin_unlock_irqrestore(
-						&sig->rlimit_events_ctx.lock, flags2);
+					spin_unlock(&sig->rlimit_events_ctx.lock);
 					rcu_read_unlock();
 					goto start_again;
 				}
@@ -337,7 +335,7 @@ static int add_new_watcher(struct rlimit_watch_fd_ctx *ctx, struct task_struct *
 {
 	struct rlimit_watcher *w;
 	struct signal_struct *signal;
-	unsigned long flags, flags2;
+	unsigned long flags;
 	int ret = 0;
 
 	if (resource >= RLIM_NLIMITS)
@@ -365,7 +363,7 @@ static int add_new_watcher(struct rlimit_watch_fd_ctx *ctx, struct task_struct *
 	 */
 	list_add_tail(&w->ctx_node, &ctx->watchers);
 	/* Now let's lock process side lock and add this torcu protected list */
-	spin_lock_irqsave(&signal->rlimit_events_ctx.lock, flags2);
+	spin_lock(&signal->rlimit_events_ctx.lock);
 
 	/* If process is in the middle of cleanup let's rollback everything */
 	if (!signal->rlimit_events_ctx.process_dead) {
@@ -378,7 +376,7 @@ static int add_new_watcher(struct rlimit_watch_fd_ctx *ctx, struct task_struct *
 		ret = -ENOENT;
 	}
 
-	spin_unlock_irqrestore(&signal->rlimit_events_ctx.lock, flags2);
+	spin_unlock(&signal->rlimit_events_ctx.lock);
 	spin_unlock_irqrestore(&ctx->noti_ctx_lock, flags);
 unlock_group_leader:
 	task_unlock(tsk->group_leader);
@@ -487,15 +485,15 @@ static int rlimit_noti_release(struct inode *inode, struct file *file)
 	struct rlimit_watch_fd_ctx *ctx = file->private_data;
 	struct rlimit_watcher *w;
 	struct rlimit_event_list *ev_list;
-	unsigned long flags, flags2;
+	unsigned long flags;
 
 	/* Clean up watchers */
 	spin_lock_irqsave(&ctx->noti_ctx_lock, flags);
 	ctx->fd_invalid = 1;
 	list_for_each_entry(w, &ctx->watchers, ctx_node) {
-		spin_lock_irqsave(&w->signal->rlimit_events_ctx.lock, flags2);
+		spin_lock(&w->signal->rlimit_events_ctx.lock);
 		list_del_rcu(&w->tsk_node);
-		spin_unlock_irqrestore(&w->signal->rlimit_events_ctx.lock, flags2);
+		spin_unlock(&w->signal->rlimit_events_ctx.lock);
 	}
 
 	while (!list_empty(&ctx->watchers)) {
