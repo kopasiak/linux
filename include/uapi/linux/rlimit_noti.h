@@ -48,12 +48,10 @@
 /* Event types */
 enum {
 	RLIMIT_EVENT_TYPE_RES_CHANGED,
-	RLIMIT_EVENT_TYPE_NEW_PID,
-	RLIMIT_EVENT_TYPE_PID_DEAD,
 	RLIMIT_EVENT_TYPE_MAX
 };
 
-/* TODO take care of padding */
+/* TODO take care of padding (packed) */
 struct rlimit_noti_subject {
 	pid_t pid;
 	uint32_t resource;
@@ -75,28 +73,4 @@ struct rlimit_event_res_changed {
 	uint64_t new_value;
 };
 
-#ifdef __KERNEL__
-
-struct rlimit_noti_ctx {
-	/* for mdification protection */
-	spinlock_t lock;
-	/* protected by RCU */
-	struct list_head watchers[RLIM_NLIMITS];
-
-	unsigned process_dead:1;
-};
-
-
-/* Public API */
-
-int rlimit_noti_task_fork(struct task_struct *parent, struct task_struct *child);
-
-void rlimit_noti_task_exit(struct task_struct *tsk);
-
-int rlimit_noti_watch_active(struct task_struct *tsk, unsigned res);
-
-void rlimit_noti_res_changed(struct task_struct *tsk, unsigned res,
-			     uint64_t old, uint64_t new);
-
-#endif
 #endif /* _UAPI_LINUX_RLIMIT_NOTI_H_ */

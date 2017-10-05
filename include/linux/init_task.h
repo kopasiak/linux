@@ -76,7 +76,7 @@ extern struct fs_struct init_fs;
 	INIT_POSIX_TIMERS(sig)						\
 	INIT_CPU_TIMERS(sig)						\
 	.rlim		= INIT_RLIMITS,					\
-	.rlimit_events_ctx = INIT_RLIMIT_EVENTS_CTX(sig.rlimit_events_ctx), \
+	INIT_RLIMIT_EVENTS_CTX(sig) 					\
 	INIT_CPUTIMER(sig)						\
 	INIT_PREV_CPUTIME(sig)						\
 	.cred_guard_mutex =						\

@@ -9,7 +9,7 @@
 #include <linux/cred.h>
 #include <linux/list.h>
 
-#include <linux/rlimit_noti.h>
+#include <linux/rlimit_noti_kern.h>
 /*
  * Types defining task->signal and task->sighand and APIs using them:
  */

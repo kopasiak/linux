@@ -407,6 +407,7 @@ ssize_t rlimit_noti_read_event(struct file *file, char __user *buf,
 			return -ERESTARTSYS;
 		spin_lock_irqsave(&ctx->events_lock, flags);
 	}
+#undef READ_COND
 
 	ev_list = list_first_entry(&ctx->events, struct rlimit_event_list, node);
 	list_del(&ev_list->node);
@@ -419,12 +420,25 @@ ssize_t rlimit_noti_read_event(struct file *file, char __user *buf,
 	return ret;
 }
 
-/* TODO implement poll
-unsigned int rlimit_noti_poll(struct file *file, struct poll_table_struct *)
-{
 
+unsigned int rlimit_noti_poll(struct file *file, struct poll_table_struct *wait)
+{
+	struct rlimit_watch_fd_ctx *ctx = file->private_data;
+	unsigned int mask = POLLWRNORM;
+	unsigned long flags;
+
+	poll_wait(file, &ctx->events_queue, wait);
+
+	spin_lock_irqsave(&ctx->events_lock, flags);
+	if (!list_empty(&ctx->events))
+		mask |= POLLIN;
+
+	/* TODO add notification when last process exited */
+	spin_unlock_irqrestore(&ctx->events_lock, flags);
+
+	return mask;
 }
-*/
+
 
 static long rlimit_noti_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -525,7 +539,7 @@ static int rlimit_noti_release(struct inode *inode, struct file *file)
 static const struct file_operations rlimit_noti_fops = {
 	.read = rlimit_noti_read_event,
 	.release = rlimit_noti_release,
-/* TODO .poll = rlimit_noti_poll, */
+	.poll = rlimit_noti_poll,
 	.unlocked_ioctl = rlimit_noti_ioctl,
 };
 

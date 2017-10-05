@@ -27,6 +27,8 @@
 	[RLIMIT_RTTIME]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
 }
 
+#ifdef CONFIG_RLIMIT_NOTIFICATION
+
 #define INIT_RLIMIT_WATCHER(watchers, limit)	\
 	[limit] = LIST_HEAD_INIT(watchers[limit])
 
@@ -50,10 +52,14 @@
 	INIT_RLIMIT_WATCHER(watchers, RLIMIT_RTTIME),		\
 }
 
-#define INIT_RLIMIT_EVENTS_CTX(ctx)			\
-{							\
-	.lock = __SPIN_LOCK_UNLOCKED(ctx.lock),			\
-	.watchers = INIT_RLIMIT_WATCHERS(ctx.watchers),	\
-	.process_dead = 0,				\
-}
+#define INIT_RLIMIT_EVENTS_CTX(sig)					\
+sig.rlimit_events_ctx = {						\
+	.lock = __SPIN_LOCK_UNLOCKED(sig.rlimit_events_ctx.lock)	\
+	.watchers = INIT_RLIMIT_WATCHERS(sig.rlimit_events_ctx.watchers),\
+	.process_dead = 0,						\
+},
+#else
+#define INIT_RLIMIT_EVENTS_CTX(sig)
+#endif /* CONFIG_RLIMIT_NOTIFICATION */
+
 #endif
