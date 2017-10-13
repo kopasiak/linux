@@ -98,6 +98,8 @@
 
 #include <trace/events/sched.h>
 
+#include <linux/rlimit_noti.h>
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/task.h>
 
@@ -1395,8 +1397,20 @@ static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
 #endif
 
 	task_lock(current->group_leader);
-	memcpy(sig->rlim, current->signal->rlim, sizeof sig->rlim);
+	memcpy(sig->rlim, current->signal->rlim, sizeof(sig->rlim));
 	task_unlock(current->group_leader);
+
+#ifdef CONFIG_RLIMIT_NOTIFICATION
+	{
+		int ret;
+
+		ret = rlimit_noti_task_fork(current->group_leader, tsk);
+		if (ret) {
+			kmem_cache_free(signal_cachep, sig);
+			return ret;
+		}
+	}
+#endif
 
 	posix_cpu_timers_init_group(sig);
 
