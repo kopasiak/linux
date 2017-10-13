@@ -332,6 +332,12 @@ config AUDIT_TREE
 	depends on AUDITSYSCALL
 	select FSNOTIFY
 
+config RLIMIT_NOTIFICATION
+       bool "Support fd notifications on given resource usage"
+       depends on NET
+       help
+	Enable this to monitor process resource changes usage via fd.
+
 source "kernel/irq/Kconfig"
 source "kernel/time/Kconfig"
 

@@ -7,7 +7,9 @@
 #include <linux/sched/jobctl.h>
 #include <linux/sched/task.h>
 #include <linux/cred.h>
+#include <linux/list.h>
 
+#include <linux/rlimit_noti_kern.h>
 /*
  * Types defining task->signal and task->sighand and APIs using them:
  */
@@ -196,6 +198,10 @@ struct signal_struct {
 	 * have no need to disable irqs.
 	 */
 	struct rlimit rlim[RLIM_NLIMITS];
+
+#ifdef CONFIG_RLIMIT_NOTIFICATION
+	struct rlimit_noti_ctx rlimit_events_ctx;
+#endif
 
 #ifdef CONFIG_BSD_PROCESS_ACCT
 	struct pacct_struct pacct;	/* per-process accounting information */
