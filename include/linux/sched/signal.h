@@ -609,4 +609,17 @@ static inline unsigned long rlimit_max(unsigned int limit)
 	return task_rlimit_max(current, limit);
 }
 
+void free_signal_struct(struct signal_struct *sig);
+
+static inline void put_signal_struct(struct signal_struct *sig)
+{
+	if (atomic_dec_and_test(&sig->sigcnt))
+		free_signal_struct(sig);
+}
+
+static inline void get_signal_struct(struct signal_struct *sig)
+{
+	atomic_inc(&sig->sigcnt);
+}
+
 #endif /* _LINUX_SCHED_SIGNAL_H */
