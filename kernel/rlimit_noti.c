@@ -777,11 +777,10 @@ static int __init rlimit_noti_init(void)
 {
 	return register_pernet_subsys(&rlimit_noti_net_ops);
 }
+__initcall(rlimit_noti_init);
 
 static void __exit rlimit_noti_exit(void)
 {
 	unregister_pernet_subsys(&rlimit_noti_net_ops);
 }
 
-module_init(rlimit_noti_init);
-module_exit(rlimit_noti_exit);
