@@ -53,8 +53,8 @@
 }
 
 #define INIT_RLIMIT_EVENTS_CTX(sig)					\
-sig.rlimit_events_ctx = {						\
-	.lock = __SPIN_LOCK_UNLOCKED(sig.rlimit_events_ctx.lock)	\
+.rlimit_events_ctx = {						\
+	.lock = __SPIN_LOCK_UNLOCKED(sig.rlimit_events_ctx.lock),	\
 	.watchers = INIT_RLIMIT_WATCHERS(sig.rlimit_events_ctx.watchers),\
 	.process_dead = 0,						\
 },

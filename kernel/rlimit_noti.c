@@ -288,7 +288,7 @@ static int rlimit_generate_res_changed_event(struct rlimit_watch_fd_ctx *ctx,
 	/* TODO add here support for PID namespace */
 	ev_list->event_data.rchanged.subj.pid = tsk->pid;
 	ev_list->event_data.rchanged.subj.resource = resource;
-//	printk("New value %d\n", (int)new);
+
 	ev_list->event_data.rchanged.new_value = new;
 
 	INIT_LIST_HEAD(&ev_list->node);
@@ -415,6 +415,9 @@ ssize_t rlimit_noti_read_event(struct file *file, char __user *buf,
 
 	/* TODO handle fault */
 	ret = copy_to_user(buf, &ev_list->ev, ev_list->ev.size);
+	if (ret == 0)
+		ret = ev_list->ev.size;
+
 	kfree(ev_list);
 
 	return ret;

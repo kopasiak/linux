@@ -480,42 +480,27 @@ struct files_struct init_files = {
 
 static unsigned int count_open_fds(struct fdtable *fdt)
 {
-	unsigned int maxfd = fdt->max_fds;
-	unsigned int maxbit = maxfd / BITS_PER_LONG;
-	unsigned int bitbit = 0;
-	unsigned int prev_bitbit = 0;
-	unsigned int count = 0;
-	uint64_t tmp;
+       unsigned int maxfd = fdt->max_fds;
+       unsigned int maxbit = maxfd / BITS_PER_LONG;
+       unsigned int count = 0;
+       int i;
 
-//	printk("start");
-	while (bitbit <= maxfd) {
-//		printk("Bitbit %u\n", bitbit);
-		bitbit = find_next_bit(fdt->open_fds, maxfd, bitbit);
-		bitbit++;
-		count++;
-	}
-	return count - 1;
-	while (1) {
-		bitbit = find_next_zero_bit(fdt->full_fds_bits, maxbit, bitbit);
-		if (bitbit > maxbit) {
-			count += (maxfd - prev_bitbit) * BITS_PER_LONG;
-			return count;
-		}
+       i = find_next_zero_bit(fdt->full_fds_bits, maxbit, 0);
+       /* If there is no free fds */
+       if (i > maxbit)
+	       return maxfd;
+#if BITS_PER_LONG == 32
+#define HWEIGHT_LONG hweight32
+#else
+#define HWEIGHT_LONG hweight64
+#endif
 
-		count += (bitbit - prev_bitbit) * BITS_PER_LONG;
-		tmp = fdt->open_fds[bitbit];
-		if (tmp)
-			count += hweight64(tmp);
+       count += i * BITS_PER_LONG;
+       for (; i < maxbit; ++i)
+               count += HWEIGHT_LONG(fdt->open_fds[i]);
 
-		bitbit++;
-		bitbit = find_next_bit(fdt->full_fds_bits,
-				       maxfd, bitbit * BITS_PER_LONG);
-		if (bitbit > maxfd)
-			return count;
-
-		bitbit /= BITS_PER_LONG;
-		prev_bitbit = bitbit;
-	}
+#undef HWEIGHT_LONG
+       return count;
 }
 
 static unsigned int find_next_fd(struct fdtable *fdt, unsigned int start)
@@ -582,10 +567,18 @@ repeat:
 	error = fd;
 
 	if (rlimit_noti_watch_active(owner, RLIMIT_NOFILE)) {
-		unsigned int count;
+		/* 
+		 * HACK HACK HACK!!!
+		 * This is obviously wrong but for now it's just a hakish
+		 * solution to show the general concept of rlimit-events.
+		 * This whould be replaced with either counting of file
+		 * descriptors when they are allocated in the bit map or
+		 * counting on demand when we should report this to user space
+		 */
+		unsigned count;
 
-//		count = count_open_fds(fdt);
-		rlimit_noti_res_changed(owner, RLIMIT_NOFILE, fd - 1, fd);
+		count = count_open_fds(fdt);
+		rlimit_noti_res_changed(owner, RLIMIT_NOFILE, count - 1, count);
 	}
 #if 1
 	/* Sanity check */
