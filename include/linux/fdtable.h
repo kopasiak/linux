@@ -106,17 +106,16 @@ void put_files_struct(struct files_struct *fs);
 void reset_files_struct(struct files_struct *);
 int unshare_files(struct files_struct **);
 struct files_struct *dup_fd(struct files_struct *, int *) __latent_entropy;
-void do_close_on_exec(struct files_struct *);
+void do_close_on_exec(struct task_struct *tsk);
 int iterate_fd(struct files_struct *, unsigned,
 		int (*)(const void *, struct file *, unsigned),
 		const void *);
 
-extern int __alloc_fd(struct files_struct *files,
-		      unsigned start, unsigned end, unsigned flags);
+extern int __alloc_fd(struct task_struct *owner,
+		      unsigned int start, unsigned int end, unsigned int flags);
 extern void __fd_install(struct files_struct *files,
 		      unsigned int fd, struct file *file);
-extern int __close_fd(struct files_struct *files,
-		      unsigned int fd);
+extern int __close_fd(struct task_struct *owner, unsigned int fd);
 
 extern struct kmem_cache *files_cachep;
 

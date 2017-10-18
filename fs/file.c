@@ -22,6 +22,7 @@
 #include <linux/spinlock.h>
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
+#include <linux/rlimit_noti_kern.h>
 
 unsigned int sysctl_nr_open __read_mostly = 1024*1024;
 unsigned int sysctl_nr_open_min = BITS_PER_LONG;
@@ -268,7 +269,7 @@ static inline void __clear_open_fd(unsigned int fd, struct fdtable *fdt)
 	__clear_bit(fd / BITS_PER_LONG, fdt->full_fds_bits);
 }
 
-static unsigned int count_open_files(struct fdtable *fdt)
+static unsigned int get_last_open_file(struct fdtable *fdt)
 {
 	unsigned int size = fdt->max_fds;
 	unsigned int i;
@@ -314,7 +315,7 @@ struct files_struct *dup_fd(struct files_struct *oldf, int *errorp)
 
 	spin_lock(&oldf->file_lock);
 	old_fdt = files_fdtable(oldf);
-	open_files = count_open_files(old_fdt);
+	open_files = get_last_open_file(old_fdt);
 
 	/*
 	 * Check whether we need to allocate a larger fd array and fd set.
@@ -345,7 +346,7 @@ struct files_struct *dup_fd(struct files_struct *oldf, int *errorp)
 		 */
 		spin_lock(&oldf->file_lock);
 		old_fdt = files_fdtable(oldf);
-		open_files = count_open_files(old_fdt);
+		open_files = get_last_open_file(old_fdt);
 	}
 
 	copy_fd_bitmaps(new_fdt, old_fdt, open_files);
@@ -477,6 +478,31 @@ struct files_struct init_files = {
 	.file_lock	= __SPIN_LOCK_UNLOCKED(init_files.file_lock),
 };
 
+static unsigned int count_open_fds(struct fdtable *fdt)
+{
+	unsigned int maxfd = fdt->max_fds;
+	unsigned int maxbit = maxfd / BITS_PER_LONG;
+	unsigned int count = 0;
+	int i;
+
+	i = find_next_zero_bit(fdt->full_fds_bits, maxbit, 0);
+	/* If there is no free fds */
+	if (i > maxbit)
+		return maxfd;
+#if BITS_PER_LONG == 32
+#define HWEIGHT_LONG hweight32
+#else
+#define HWEIGHT_LONG hweight64
+#endif
+
+	count += i * BITS_PER_LONG;
+	for (; i < maxbit; ++i)
+		count += HWEIGHT_LONG(fdt->open_fds[i]);
+
+#undef HWEIGHT_LONG
+	return count;
+}
+
 static unsigned int find_next_fd(struct fdtable *fdt, unsigned int start)
 {
 	unsigned int maxfd = fdt->max_fds;
@@ -494,9 +520,10 @@ static unsigned int find_next_fd(struct fdtable *fdt, unsigned int start)
 /*
  * allocate a file descriptor, mark it busy.
  */
-int __alloc_fd(struct files_struct *files,
-	       unsigned start, unsigned end, unsigned flags)
+int __alloc_fd(struct task_struct *owner, unsigned int start, unsigned int end,
+	       unsigned int flags)
 {
+	struct files_struct *files = owner->files;
 	unsigned int fd;
 	int error;
 	struct fdtable *fdt;
@@ -539,6 +566,13 @@ repeat:
 	else
 		__clear_close_on_exec(fd, fdt);
 	error = fd;
+
+	if (rlimit_noti_watch_active(owner, RLIMIT_NOFILE)) {
+		unsigned int count;
+
+		count = count_open_fds(fdt);
+		rlimit_noti_res_changed(owner, RLIMIT_NOFILE, count - 1, count);
+	}
 #if 1
 	/* Sanity check */
 	if (rcu_access_pointer(fdt->fd[fd]) != NULL) {
@@ -554,28 +588,37 @@ out:
 
 static int alloc_fd(unsigned start, unsigned flags)
 {
-	return __alloc_fd(current->files, start, rlimit(RLIMIT_NOFILE), flags);
+	return __alloc_fd(current,
+			  start, rlimit(RLIMIT_NOFILE), flags);
 }
 
 int get_unused_fd_flags(unsigned flags)
 {
-	return __alloc_fd(current->files, 0, rlimit(RLIMIT_NOFILE), flags);
+	return alloc_fd(0, flags);
 }
 EXPORT_SYMBOL(get_unused_fd_flags);
 
-static void __put_unused_fd(struct files_struct *files, unsigned int fd)
+static void __put_unused_fd(struct task_struct *owner, unsigned int fd)
 {
+	struct files_struct *files = owner->files;
 	struct fdtable *fdt = files_fdtable(files);
 	__clear_open_fd(fd, fdt);
 	if (fd < files->next_fd)
 		files->next_fd = fd;
+
+	if (rlimit_noti_watch_active(owner, RLIMIT_NOFILE)) {
+		unsigned int count;
+
+		count = count_open_fds(fdt);
+		rlimit_noti_res_changed(owner, RLIMIT_NOFILE, count + 1, count);
+	}
 }
 
 void put_unused_fd(unsigned int fd)
 {
 	struct files_struct *files = current->files;
 	spin_lock(&files->file_lock);
-	__put_unused_fd(files, fd);
+	__put_unused_fd(current, fd);
 	spin_unlock(&files->file_lock);
 }
 
@@ -632,8 +675,9 @@ EXPORT_SYMBOL(fd_install);
 /*
  * The same warnings as for __alloc_fd()/__fd_install() apply here...
  */
-int __close_fd(struct files_struct *files, unsigned fd)
+int __close_fd(struct task_struct *owner, unsigned int fd)
 {
+	struct files_struct *files = owner->files;
 	struct file *file;
 	struct fdtable *fdt;
 
@@ -646,7 +690,7 @@ int __close_fd(struct files_struct *files, unsigned fd)
 		goto out_unlock;
 	rcu_assign_pointer(fdt->fd[fd], NULL);
 	__clear_close_on_exec(fd, fdt);
-	__put_unused_fd(files, fd);
+	__put_unused_fd(owner, fd);
 	spin_unlock(&files->file_lock);
 	return filp_close(file, files);
 
@@ -655,10 +699,11 @@ out_unlock:
 	return -EBADF;
 }
 
-void do_close_on_exec(struct files_struct *files)
+void do_close_on_exec(struct task_struct *tsk)
 {
 	unsigned i;
 	struct fdtable *fdt;
+	struct files_struct *files = tsk->files;
 
 	/* exec unshares first */
 	spin_lock(&files->file_lock);
@@ -680,7 +725,7 @@ void do_close_on_exec(struct files_struct *files)
 			if (!file)
 				continue;
 			rcu_assign_pointer(fdt->fd[fd], NULL);
-			__put_unused_fd(files, fd);
+			__put_unused_fd(tsk, fd);
 			spin_unlock(&files->file_lock);
 			filp_close(file, files);
 			cond_resched();
@@ -852,6 +897,16 @@ __releases(&files->file_lock)
 		__set_close_on_exec(fd, fdt);
 	else
 		__clear_close_on_exec(fd, fdt);
+
+	/* If fd was previously open then number of opened fd stays untouched */
+	if (!tofree && rlimit_noti_watch_active(current, RLIMIT_NOFILE)) {
+		unsigned int count;
+
+		count = count_open_fds(fdt);
+		rlimit_noti_res_changed(current, RLIMIT_NOFILE,
+					count - 1, count);
+	}
+
 	spin_unlock(&files->file_lock);
 
 	if (tofree)
@@ -870,7 +925,7 @@ int replace_fd(unsigned fd, struct file *file, unsigned flags)
 	struct files_struct *files = current->files;
 
 	if (!file)
-		return __close_fd(files, fd);
+		return __close_fd(current, fd);
 
 	if (fd >= rlimit(RLIMIT_NOFILE))
 		return -EBADF;
